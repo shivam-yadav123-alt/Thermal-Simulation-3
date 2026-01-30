@@ -1,0 +1,423 @@
+//
+//  ContentView.swift
+//  Thermal Simulator
+//
+//  Created by SHIVAM YADAV on 30/01/26.c
+import SwiftUI
+import Charts
+import Combine
+
+// MARK: - 1. PHYSICS CONSTANTS & CONFIGURATION
+struct SimulationConfig {
+    // Room Geometry: 10m x 8m x 3m
+    static let roomVolume: Double = 240.0 // m^3
+    static let airDensity: Double = 1.225 // kg/m^3
+    static let specificHeatAir: Double = 1005.0 // J/kg*K
+    // Thermal Mass (MCp) approx 295,000 J/K
+    static let thermalMass: Double = roomVolume * airDensity * specificHeatAir
+    
+    // Heat Sources (Watts)
+    static let heatPerStudent: Double = 100.0 // Metabolic rate (sitting)
+    static let heatBaseLoad: Double = 500.0   // Lights, Projector, etc.
+    
+    // HVAC Limits (Watts)
+    static let maxHeatingPower: Double = 5000.0 // 5 kW heater
+    static let maxCoolingPower: Double = -5000.0 // 5 kW AC
+}
+
+// MARK: - 2. DATA MODELS
+
+struct DataPoint: Identifiable {
+    let id = UUID()
+    let time: Double
+    let temperature: Double
+    let outsideTemp: Double
+    let hvacPower: Double
+}
+
+class ThermalSimulator: ObservableObject {
+    // --- State Variables ---
+    @Published var currentTemp: Double = 22.0
+    @Published var outsideTemp: Double = 15.0
+    @Published var targetTemp: Double = 22.0
+    @Published var studentCount: Double = 20.0
+    @Published var insulationQuality: Double = 0.5 // 0.0 (Open window) to 1.0 (Perfect)
+    @Published var isRunning: Bool = false
+    @Published var simulationTime: Double = 0.0 // Minutes
+    
+    // --- Outputs ---
+    @Published var currentPower: Double = 0.0 // Watts (+ is heating, - is cooling)
+    @Published var totalEnergyUsed: Double = 0.0 // kWh
+    @Published var history: [DataPoint] = []
+    
+    // --- Internal Physics ---
+    private var timer: AnyCancellable?
+    private let timeStep: Double = 1.0 // 1 second per tick
+    
+    // --- Control Logic (Simple Proportional Control) ---
+    private func calculateHVACPower() -> Double {
+        let error = targetTemp - currentTemp
+        let kp: Double = 2000.0 // Proportional gain (Watts per degree error)
+        
+        var demand = error * kp
+        
+        // Clamp to equipment limits
+        if demand > SimulationConfig.maxHeatingPower { demand = SimulationConfig.maxHeatingPower }
+        if demand < SimulationConfig.maxCoolingPower { demand = SimulationConfig.maxCoolingPower }
+        
+        // Deadband (don't turn on for tiny fluctuations)
+        if abs(error) < 0.2 { demand = 0.0 }
+        
+        return demand
+    }
+    
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        timer = Timer.publish(every: 0.05, on: .main, in: .common) // Fast simulation speed
+            .autoconnect()
+            .sink { _ in self.step() }
+    }
+    
+    func stop() {
+        isRunning = false
+        timer?.cancel()
+    }
+    
+    func reset() {
+        stop()
+        currentTemp = 22.0
+        simulationTime = 0.0
+        totalEnergyUsed = 0.0
+        history = []
+    }
+    
+    private func step() {
+        // 1. Calculate Loads (Q) in Watts
+        
+        // Internal Load (People + Equipment)
+        let qInternal = (studentCount * SimulationConfig.heatPerStudent) + SimulationConfig.heatBaseLoad
+        
+        // Conduction/Convection Loss (U-Value simplified)
+        // High insulation = Low UA. Low insulation = High UA.
+        // Base UA ~ 200 W/K. Poor insulation multiplier ~ 5x.
+        let baseUA = 150.0
+        let insulationFactor = 1.0 + (1.0 - insulationQuality) * 4.0
+        let effectiveUA = baseUA * insulationFactor
+        let qLoss = effectiveUA * (outsideTemp - currentTemp)
+        
+        // HVAC Load
+        let qHVAC = calculateHVACPower()
+        currentPower = qHVAC
+        
+        // Total Heat Flow
+        let qTotal = qInternal + qLoss + qHVAC
+        
+        // 2. Update Temperature (dT = Q * dt / MCp)
+        let dT = (qTotal * timeStep) / SimulationConfig.thermalMass
+        currentTemp += dT
+        
+        // 3. Update Metrics
+        simulationTime += (timeStep / 60.0) // Convert seconds to minutes for display
+        
+        // Energy in kWh = (Power(W) * Time(h)) / 1000
+        let powerConsumedAbs = abs(qHVAC)
+        totalEnergyUsed += (powerConsumedAbs * (timeStep / 3600.0)) / 1000.0
+        
+        // 4. Record History (Throttle to avoid memory overflow)
+        if Int(simulationTime * 10) % 5 == 0 { // Record every few frames
+            if history.count > 200 { history.removeFirst() } // Keep graph clean
+            history.append(DataPoint(time: simulationTime, temperature: currentTemp, outsideTemp: outsideTemp, hvacPower: qHVAC))
+        }
+    }
+}
+
+// MARK: - 3. VISUALIZATION COMPONENTS
+
+struct RoomView: View {
+    @ObservedObject var sim: ThermalSimulator
+    
+    var roomColor: Color {
+        // Map temp 15°C (Blue) to 30°C (Red)
+        let t = sim.currentTemp
+        if t < 18 { return Color.blue.opacity(0.3) }
+        if t > 26 { return Color.red.opacity(0.3) }
+        return Color.green.opacity(0.3)
+    }
+    
+    var body: some View {
+        ZStack {
+            // Room Shell
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.secondary, lineWidth: 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(roomColor)
+                        .animation(.linear(duration: 0.5), value: sim.currentTemp)
+                )
+                .frame(height: 300)
+                .overlay(alignment: .bottom) {
+                    // Floor
+                    Rectangle().fill(Color.brown.opacity(0.6)).frame(height: 20)
+                }
+            
+            // Windows
+            HStack(spacing: 40) {
+                WindowShape(opacity: 1.0 - sim.insulationQuality)
+                WindowShape(opacity: 1.0 - sim.insulationQuality)
+            }
+            .offset(y: -50)
+            
+            // HVAC Unit (Ceiling)
+            VStack {
+                HStack {
+                    Image(systemName: "fanblades.fill")
+                        .font(.largeTitle)
+                        .foregroundColor(sim.currentPower > 0 ? .red : (sim.currentPower < 0 ? .blue : .gray))
+                        .rotationEffect(.degrees(sim.isRunning && abs(sim.currentPower) > 100 ? 360 * 5 : 0)) // Spin animation logic usually requires separate state, simplifying here
+                    
+                    Text(sim.currentPower > 100 ? "HEATING" : (sim.currentPower < -100 ? "COOLING" : "IDLE"))
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                        .padding(6)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(8)
+                }
+                .padding(.top, 20)
+                Spacer()
+            }
+            
+            // Students
+            HStack(spacing: -10) {
+                ForEach(0..<Int(sim.studentCount), id: \.self) { _ in
+                    Image(systemName: "person.fill")
+                        .foregroundColor(.primary)
+                        .font(.title2)
+                        .transition(.scale)
+                }
+            }
+            .frame(width: 380)
+            .clipped()
+            .offset(y: 100)
+            
+            // Dynamic Particles (Airflow)
+            if abs(sim.currentPower) > 100 {
+                ParticleSystem(isHeating: sim.currentPower > 0)
+            }
+        }
+    }
+}
+
+struct WindowShape: View {
+    var opacity: Double // Represents "Open-ness" or poor insulation
+    var body: some View {
+        ZStack {
+            Rectangle().fill(Color.blue.opacity(0.2)).frame(width: 80, height: 100)
+            Rectangle().stroke(Color.white, lineWidth: 2).frame(width: 80, height: 100)
+            // Visual crack/open indication
+            if opacity > 0.5 {
+                Rectangle().fill(Color.black.opacity(0.1)).frame(width: 80, height: 30).offset(y: 35)
+            }
+        }
+    }
+}
+
+// Simple Particle System for Visual Flair
+struct ParticleSystem: View {
+    let isHeating: Bool
+    @State private var phase: CGFloat = 0
+    
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            Canvas { context, size in
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                let color = isHeating ? Color.red.opacity(0.6) : Color.blue.opacity(0.6)
+                
+                for i in 0..<10 {
+                    let xPos = (size.width / 2.0) + cos(time + Double(i)) * 50
+                    // Heating rises, Cooling falls
+                    let yOffset = isHeating ? -1 * ((time * 100 + Double(i) * 50).truncatingRemainder(dividingBy: size.height)) : ((time * 100 + Double(i) * 50).truncatingRemainder(dividingBy: size.height))
+                    
+                    let yPos = isHeating ? size.height + yOffset : -50 + yOffset
+                    
+                    let rect = CGRect(x: xPos, y: yPos, width: 8, height: 8)
+                    context.fill(Path(ellipseIn: rect), with: .color(color))
+                }
+            }
+        }
+        .frame(width: 200, height: 300)
+        .allowsHitTesting(false)
+    }
+}
+
+// MARK: - 4. MAIN DASHBOARD
+
+struct ContentView: View {
+    @StateObject var sim = ThermalSimulator()
+    
+    var body: some View {
+        HSplitView {
+            // LEFT PANEL: Controls
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text("Settings")
+                        .font(.title2).bold()
+                    
+                    Group {
+                        ControlSection(title: "Thermostat Setpoint", value: $sim.targetTemp, range: 15...30, step: 0.5, unit: "°C", color: .orange)
+                        
+                        ControlSection(title: "Outside Temp", value: $sim.outsideTemp, range: -10...40, step: 1, unit: "°C", color: .blue)
+                        
+                        ControlSection(title: "Occupancy", value: $sim.studentCount, range: 0...40, step: 1, unit: " students", color: .green)
+                        
+                        VStack(alignment: .leading) {
+                            Text("Insulation Quality")
+                            Slider(value: $sim.insulationQuality, in: 0...1) {
+                                Text("Label")
+                            } minimumValueLabel: {
+                                Image(systemName: "wind").foregroundColor(.blue)
+                            } maximumValueLabel: {
+                                Image(systemName: "shield.fill").foregroundColor(.green)
+                            }
+                            Text(sim.insulationQuality > 0.8 ? "Excellent (Triple Glazed)" : (sim.insulationQuality < 0.3 ? "Poor (Windows Open)" : "Average"))
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .cornerRadius(10)
+                    
+                    Divider()
+                    
+                    HStack {
+                        Button(action: sim.isRunning ? sim.stop : sim.start) {
+                            Label(sim.isRunning ? "Pause" : "Start Simulation", systemImage: sim.isRunning ? "pause.fill" : "play.fill")
+                        }
+                        .controlSize(.large)
+                        
+                        Button("Reset", role: .destructive, action: sim.reset)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .padding()
+            }
+            .frame(minWidth: 300, maxWidth: 350)
+            
+            // RIGHT PANEL: Visualization & Data
+            VStack {
+                // Top: Room Visual
+                RoomView(sim: sim)
+                    .padding()
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .shadow(radius: 2)
+                    .padding()
+                
+                // Middle: Live Metrics
+                HStack(spacing: 40) {
+                    MetricCard(title: "Room Temp", value: String(format: "%.1f°C", sim.currentTemp), icon: "thermometer.medium", color: .primary)
+                    MetricCard(title: "HVAC Power", value: String(format: "%.0f W", sim.currentPower), icon: "bolt.fill", color: sim.currentPower > 0 ? .red : (sim.currentPower < 0 ? .blue : .gray))
+                    MetricCard(title: "Energy Used", value: String(format: "%.3f kWh", sim.totalEnergyUsed), icon: "leaf.fill", color: .green)
+                }
+                .padding(.horizontal)
+                
+                // Bottom: Charts
+                VStack(alignment: .leading) {
+                    Text("Live Telemetry")
+                        .font(.headline)
+                        .padding(.leading)
+                    
+                    Chart {
+                        ForEach(sim.history) { point in
+                            LineMark(
+                                x: .value("Time", point.time),
+                                y: .value("Room Temp", point.temperature)
+                            )
+                            .foregroundStyle(.orange)
+                            .interpolationMethod(.catmullRom)
+                            
+                            LineMark(
+                                x: .value("Time", point.time),
+                                y: .value("Outside", point.outsideTemp)
+                            )
+                            .foregroundStyle(.blue.opacity(0.5))
+                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 5]))
+                            
+                            RuleMark(y: .value("Set Point", sim.targetTemp))
+                                .foregroundStyle(.green)
+                                .lineStyle(StrokeStyle(lineWidth: 1))
+                        }
+                    }
+                    .chartYScale(domain: 10...35)
+                    .chartXAxisLabel("Time (minutes)")
+                    .chartYAxisLabel("Temperature (°C)")
+                    .frame(height: 200)
+                    .padding()
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(12)
+                .padding()
+            }
+        }
+        .frame(minWidth: 900, minHeight: 700)
+    }
+}
+
+// MARK: - 5. HELPER VIEWS
+
+struct ControlSection: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let unit: String
+    let color: Color
+    
+    var body: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text("\(String(format: "%.1f", value))\(unit)")
+                    .bold()
+                    .foregroundColor(color)
+            }
+            Slider(value: $value, in: range, step: step)
+                .tint(color)
+        }
+    }
+}
+
+struct MetricCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    let color: Color
+    
+    var body: some View {
+        HStack {
+            Image(systemName: icon)
+                .font(.title)
+                .foregroundColor(color)
+                .frame(width: 40)
+            
+            VStack(alignment: .leading) {
+                Text(title)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(value)
+                    .font(.title3)
+                    .bold()
+                    .monospacedDigit()
+            }
+        }
+        .frame(minWidth: 120)
+        .padding()
+        .background(Color(nsColor: .controlBackgroundColor))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.gray.opacity(0.2), lineWidth: 1)
+        )
+    }
+}
+
